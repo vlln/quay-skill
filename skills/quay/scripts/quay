@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""
+Quay CLI - small helper for Quay.io repository and tag inspection.
+
+Usage:
+    quay search <query> [--namespace <name>] [--limit <n>]
+    quay inspect <namespace>/<repo>
+    quay inspect <namespace>/<repo>:<tag>
+    quay tags <namespace>/<repo> [--limit <n>] [--page <n>] [--all]
+    quay help
+"""
+
+import argparse
+import email.utils
+import json
+import os
+import shutil
+import sys
+import textwrap
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List, Optional, Tuple
+
+
+DEFAULT_API_URL = "https://quay.io/api/v1"
+DEFAULT_LIMIT = 25
+MIN_TABLE_WIDTH = 72
+DEFAULT_TABLE_WIDTH = 120
+
+
+def api_base_url() -> str:
+    return os.environ.get("QUAY_API_URL", DEFAULT_API_URL).rstrip("/")
+
+
+def auth_headers() -> Dict[str, str]:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "bio-skills-quay/0.1",
+    }
+    token = os.environ.get("QUAY_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def request_json(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    url = f"{api_base_url()}/{endpoint.lstrip('/')}"
+    if params:
+        clean_params = {
+            key: value
+            for key, value in params.items()
+            if value is not None and value != ""
+        }
+        if clean_params:
+            url = f"{url}?{urllib.parse.urlencode(clean_params)}"
+
+    req = urllib.request.Request(url, headers=auth_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        print(f"error: HTTP {err.code} for {url}", file=sys.stderr)
+        try:
+            body = err.read().decode("utf-8")
+            data = json.loads(body)
+            message = data.get("error_message") or data.get("message")
+            if message:
+                print(f"error: {message}", file=sys.stderr)
+        except Exception:
+            pass
+        sys.exit(1)
+    except urllib.error.URLError as err:
+        print(f"error: failed to connect to Quay API: {err.reason}", file=sys.stderr)
+        sys.exit(1)
+    except TimeoutError:
+        print("error: Quay API request timed out", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError:
+        print("error: invalid JSON response from Quay API", file=sys.stderr)
+        sys.exit(1)
+
+
+def parse_repo(value: str) -> Tuple[str, str]:
+    image = value
+    if image.startswith("quay.io/"):
+        image = image[len("quay.io/"):]
+    parts = image.split("/")
+    if len(parts) != 2 or not all(parts):
+        print("error: repository must be <namespace>/<repo>", file=sys.stderr)
+        sys.exit(1)
+    return parts[0], parts[1]
+
+
+def parse_image_ref(value: str) -> Tuple[str, str, str]:
+    image = value
+    if image.startswith("quay.io/"):
+        image = image[len("quay.io/"):]
+    if ":" not in image:
+        print("error: image reference must be <namespace>/<repo>:<tag>", file=sys.stderr)
+        sys.exit(1)
+    repo_part, tag = image.rsplit(":", 1)
+    if not tag:
+        print("error: tag must not be empty", file=sys.stderr)
+        sys.exit(1)
+    namespace, repo = parse_repo(repo_part)
+    return namespace, repo, tag
+
+
+def size_mb(size: Any) -> str:
+    try:
+        size_int = int(size)
+    except (TypeError, ValueError):
+        return "-"
+    if size_int <= 0:
+        return "-"
+    return f"{size_int / (1024 * 1024):.1f} MB"
+
+
+def normalize_text(text: Any) -> str:
+    return " ".join(str(text or "").replace("\n", " ").split())
+
+
+def compact_digest(digest: Any) -> str:
+    value = normalize_text(digest)
+    if not value or value == "-":
+        return "-"
+    if len(value) <= 28:
+        return value
+    if value.startswith("sha256:"):
+        return f"sha256:{value[7:16]}...{value[-9:]}"
+    return f"{value[:9]}...{value[-9:]}"
+
+
+def compact_time(value: Any) -> str:
+    text = normalize_text(value)
+    if not text or text == "-":
+        return "-"
+    try:
+        parsed = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return text
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def terminal_width() -> int:
+    width = shutil.get_terminal_size((DEFAULT_TABLE_WIDTH, 24)).columns
+    return max(MIN_TABLE_WIDTH, width)
+
+
+def wrap_cell(value: Any, width: int) -> List[str]:
+    text = normalize_text(value)
+    if not text:
+        return [""]
+    return textwrap.wrap(
+        text,
+        width=max(1, width),
+        break_long_words=True,
+        break_on_hyphens=False,
+        replace_whitespace=False,
+    ) or [""]
+
+
+def limit_lines(lines: List[str], max_lines: Optional[int]) -> List[str]:
+    if not max_lines or len(lines) <= max_lines:
+        return lines
+    limited = lines[:max_lines]
+    last = limited[-1]
+    if len(last) <= 3:
+        limited[-1] = "." * len(last)
+    else:
+        limited[-1] = f"{last[:-3]}..."
+    return limited
+
+
+def print_field(label: str, value: Any, width: Optional[int] = None) -> None:
+    text = normalize_text(value)
+    if not text:
+        return
+    prefix = f"{label}:"
+    indent = " " * 14
+    body_width = max(24, (width or terminal_width()) - len(indent))
+    lines = wrap_cell(text, body_width)
+    print(f"{prefix:<13} {lines[0]}")
+    for line in lines[1:]:
+        print(f"{indent}{line}")
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError("must be an integer") from err
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def fit_widths(headers: List[str], rows: List[List[str]], max_widths: Dict[str, int]) -> List[int]:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            max_width = max_widths.get(headers[idx], 80)
+            widths[idx] = max(widths[idx], min(len(normalize_text(cell)), max_width))
+
+    available = terminal_width() - (2 * (len(headers) - 1))
+    min_widths = [min(max(len(header), 8), max_widths.get(header, 80)) for header in headers]
+    while sum(widths) > available and any(widths[idx] > min_widths[idx] for idx in range(len(widths))):
+        idx = max(range(len(widths)), key=lambda item: widths[item] - min_widths[item])
+        if widths[idx] <= min_widths[idx]:
+            break
+        widths[idx] -= 1
+    return widths
+
+
+def print_table(
+    headers: List[str],
+    rows: List[List[str]],
+    max_widths: Optional[Dict[str, int]] = None,
+    max_lines: Optional[Dict[str, int]] = None,
+) -> None:
+    if not rows:
+        print("(no data)")
+        return
+    max_widths = max_widths or {}
+    max_lines = max_lines or {}
+    widths = fit_widths(headers, rows, max_widths)
+    print("  ".join(header.ljust(widths[idx]) for idx, header in enumerate(headers)))
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        wrapped = [
+            limit_lines(wrap_cell(cell, widths[idx]), max_lines.get(headers[idx]))
+            for idx, cell in enumerate(row)
+        ]
+        height = max(len(cell_lines) for cell_lines in wrapped)
+        for line_idx in range(height):
+            cells = [
+                (wrapped[col_idx][line_idx] if line_idx < len(wrapped[col_idx]) else "").ljust(widths[col_idx])
+                for col_idx in range(len(headers))
+            ]
+            print("  ".join(cells).rstrip())
+
+
+def cmd_search(args: argparse.Namespace) -> None:
+    params = {
+        "query": args.query,
+        "namespace": args.namespace,
+        "public": "true",
+    }
+    data = request_json("/repository", params)
+    repos = data.get("repositories", [])
+    if args.limit:
+        repos = repos[: args.limit]
+
+    rows = []
+    for repo in repos:
+        name = f"{repo.get('namespace')}/{repo.get('name')}"
+        visibility = "public" if repo.get("is_public") else "private"
+        state = repo.get("state", "-")
+        rows.append([name, visibility, state, normalize_text(repo.get("description"))])
+
+    print_table(
+        ["REPOSITORY", "VISIBILITY", "STATE", "DESCRIPTION"],
+        rows,
+        {"REPOSITORY": 36, "VISIBILITY": 10, "STATE": 10, "DESCRIPTION": 80},
+        {"DESCRIPTION": 3},
+    )
+    total = len(data.get("repositories", []))
+    suffix = f" (showing first {len(repos)})" if len(repos) < total else ""
+    print(f"\nFound {total} repository result(s){suffix}")
+
+
+def inspect_repository(repository: str) -> None:
+    namespace, repo = parse_repo(repository)
+    data = request_json(f"/repository/{namespace}/{repo}")
+    visibility = "public" if data.get("is_public") else "private"
+    print_field("Repository", f"quay.io/{namespace}/{repo}")
+    print_field("Namespace", namespace)
+    print_field("Name", repo)
+    print_field("Visibility", visibility)
+    print_field("Kind", data.get("kind", "-"))
+    print_field("State", data.get("state", "-"))
+    print_field("Description", data.get("description"))
+    print_field("Homepage", data.get("homepage"))
+    print_field("Modified", data.get("last_modified"))
+    print_field("Pull", f"docker pull quay.io/{namespace}/{repo}:<tag>")
+
+
+def tag_rows(
+    tags: List[Dict[str, Any]],
+    namespace: str,
+    repo: str,
+    include_image: bool,
+) -> List[List[str]]:
+    rows = []
+    for tag in tags:
+        name = tag.get("name", "-")
+        row = [
+            name,
+            size_mb(tag.get("size")),
+            compact_time(tag.get("last_modified")),
+            compact_digest(tag.get("manifest_digest")),
+        ]
+        if include_image:
+            row.append(f"quay.io/{namespace}/{repo}:{name}")
+        rows.append(row)
+    return rows
+
+
+def cmd_tags(args: argparse.Namespace) -> None:
+    namespace, repo = parse_repo(args.repository)
+    if args.all and args.limit < DEFAULT_LIMIT:
+        print(
+            f"note: using --limit {DEFAULT_LIMIT} with --all to reduce paginated API requests",
+            file=sys.stderr,
+        )
+        args.limit = DEFAULT_LIMIT
+    all_tags = fetch_tags(namespace, repo, args.limit, args.page, args.all)
+    include_image = terminal_width() >= 110
+    headers = ["TAG", "SIZE", "MODIFIED", "DIGEST"]
+    max_widths = {"TAG": 32, "SIZE": 8, "MODIFIED": 16, "DIGEST": 31}
+    if include_image:
+        headers.append("IMAGE")
+        max_widths["IMAGE"] = 80
+
+    print_table(
+        headers,
+        tag_rows(all_tags, namespace, repo, include_image),
+        max_widths,
+        {"TAG": 2, "IMAGE": 2},
+    )
+    print(f"\nRepository: quay.io/{namespace}/{repo}")
+    print(f"Tags shown: {len(all_tags)}")
+    if not include_image:
+        print("Tip: run `inspect <repository>:<tag>` for the full digest and pull commands.")
+
+
+def fetch_tags(
+    namespace: str,
+    repo: str,
+    limit: int = DEFAULT_LIMIT,
+    page: int = 1,
+    fetch_all: bool = False,
+) -> List[Dict[str, Any]]:
+    all_tags: List[Dict[str, Any]] = []
+    while True:
+        data = request_json(
+            f"/repository/{namespace}/{repo}/tag/",
+            {
+                "limit": limit,
+                "page": page,
+                "onlyActiveTags": "true",
+            },
+        )
+        tags = data.get("tags", [])
+        all_tags.extend(tags)
+        if not fetch_all or not data.get("has_additional"):
+            break
+        page += 1
+    return all_tags
+
+
+def inspect_tag(image_ref: str) -> None:
+    namespace, repo, tag = parse_image_ref(image_ref)
+    data = find_tag(namespace, repo, tag)
+    image = f"quay.io/{namespace}/{repo}:{tag}"
+
+    print_field("Image", image)
+    print_field("Tag", data.get("name", tag))
+    print_field("Size", size_mb(data.get("size")))
+    print_field("Modified", data.get("last_modified", "-"))
+    print_field("Digest", data.get("manifest_digest", "-"))
+    print_field("ManifestList", data.get("is_manifest_list", "-"))
+    print_field("Pull", f"docker pull {image}")
+    print_field("Podman", f"podman pull {image}")
+
+
+def cmd_inspect(args: argparse.Namespace) -> None:
+    target = args.target
+    if ":" in target:
+        inspect_tag(target)
+    else:
+        inspect_repository(target)
+
+
+def find_tag(namespace: str, repo: str, tag_name: str) -> Dict[str, Any]:
+    page = 1
+    while True:
+        data = request_json(
+            f"/repository/{namespace}/{repo}/tag/",
+            {
+                "limit": 100,
+                "page": page,
+                "onlyActiveTags": "true",
+            },
+        )
+        for tag in data.get("tags", []):
+            if tag.get("name") == tag_name:
+                return tag
+        if not data.get("has_additional"):
+            break
+        page += 1
+    print(f"error: tag not found: quay.io/{namespace}/{repo}:{tag_name}", file=sys.stderr)
+    sys.exit(1)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Query Quay.io repositories and tags",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    search = subparsers.add_parser("search", help="Search repositories")
+    search.add_argument("query", help="Search query")
+    search.add_argument("--namespace", help="Restrict search to a namespace")
+    search.add_argument("--limit", type=positive_int, default=DEFAULT_LIMIT, help="Maximum rows to show")
+    search.set_defaults(func=cmd_search)
+
+    inspect = subparsers.add_parser("inspect", help="Inspect a repository or image tag")
+    inspect.add_argument(
+        "target",
+        help="<namespace>/<repo> or <namespace>/<repo>:<tag>",
+    )
+    inspect.set_defaults(func=cmd_inspect)
+
+    tags = subparsers.add_parser("tags", help="List active tags")
+    tags.add_argument("repository", help="<namespace>/<repo> or quay.io/<namespace>/<repo>")
+    tags.add_argument("--limit", type=positive_int, default=DEFAULT_LIMIT, help="Tags per page")
+    tags.add_argument("--page", type=positive_int, default=1, help="Page number")
+    tags.add_argument("--all", action="store_true", help="Fetch all available pages")
+    tags.set_defaults(func=cmd_tags)
+
+    subparsers.add_parser("help", help="Show help")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.command or args.command == "help":
+        parser.print_help()
+        sys.exit(0 if args.command == "help" else 1)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
