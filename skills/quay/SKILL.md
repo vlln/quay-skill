@@ -22,38 +22,45 @@ podman pull, manifest digest, image digest, repository search
 
 ## When To Use
 
-Use this skill for generic Quay.io registry tasks: searching repositories,
-checking whether `quay.io/<namespace>/<repo>` exists, listing tags, inspecting a
-specific tag, and reporting image digests or pull commands.
+Use for generic Quay.io registry operations: search repositories, list tags,
+inspect tag metadata, resolve pull references.
+
+Prefer the `biocontainers` skill for BioContainers tool discovery, upstream
+version resolution, and GA4GH TRS workflows.
 
 ## Capabilities
 
-- **Search** for repositories by name or keyword, optionally scoped to a namespace.
+- **Search** repositories by name or keyword, optionally scoped to a namespace.
 - **Inspect** a repository to see metadata, visibility, and description.
-- **List tags** for a repository, showing tag names, sizes, modification dates, and digests.
-- **Inspect a specific tag** to get the full manifest digest and a ready-to-run pull command.
+- **List tags** for a repository, showing tag names, sizes, modification dates,
+  and digests.
+- **Inspect a tag** to get the full manifest digest and pull commands.
 
-## Output
-
-Report the matching repository, relevant tag metadata, digest, and the exact
-`docker pull` or `podman pull` command the user can run next. Include ambiguity
-when search returns multiple plausible repositories.
+All operations are available through the `scripts/quay` CLI. Run
+`scripts/quay help` for complete usage.
 
 ## Configuration
 
-- Set `QUAY_TOKEN` to authenticate for private or restricted repositories. Do not write tokens into this repository.
-- Set `QUAY_API_URL` to override the default `https://quay.io/api/v1` endpoint for Quay Enterprise deployments.
+- `QUAY_TOKEN` — Bearer token for authenticating to private or restricted
+  repositories.
+- `QUAY_API_URL` — Override the API base URL for Quay Enterprise deployments.
+  Default: `https://quay.io/api/v1`.
 
-## Rules
+## Output
 
-- Prefer the `biocontainers` skill for BioContainers tool discovery, upstream version resolution, and GA4GH TRS workflows.
-- Use this skill when the task is registry-level Quay work: namespace/repository search, tag lists, tag timestamps, image sizes, manifest digests, or pull references.
-- Report `quay.io/<namespace>/<repo>:<tag>` and `manifest_digest` exactly as returned by the API.
+Always include the exact `quay.io/<namespace>/<repo>:<tag>` reference and the
+full manifest digest when reporting results. If a search returns multiple
+plausible repositories, present the ambiguity explicitly rather than guessing.
 
 ## Gotchas
 
-- The Quay API paginates tag listings; fetching all tags requires iterating through paginated API responses.
-- Tag inspection searches through all tags sequentially (not a direct API call), so it can be slow for repositories with many tags.
-- Search results are limited to public repositories unless `QUAY_TOKEN` is set and the token has access to private repositories.
-- Enterprise Quay instances may have different API paths; ensure `QUAY_API_URL` is set correctly for self-hosted deployments.
-- Manifest digests displayed in the tag listing table are truncated for readability; use tag inspection for the full digest.
+- Tag listing is paginated. Use `--all` to fetch every page, or `--page` to
+  target a specific page.
+- Tag inspection scans tags sequentially (no direct tag-lookup API endpoint).
+  It can be slow for repositories with thousands of tags.
+- Manifest digests shown in the tag listing table are truncated for readability.
+  Use tag inspection (`<namespace>/<repo>:<tag>`) for the full digest.
+- Search results only include public repositories unless `QUAY_TOKEN` is set
+  and the token grants access to private repos.
+- Enterprise Quay instances may use different API paths. Set `QUAY_API_URL`
+  correctly for self-hosted deployments.
